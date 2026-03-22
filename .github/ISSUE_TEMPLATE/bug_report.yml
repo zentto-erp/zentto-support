@@ -1,0 +1,67 @@
+name: "🐛 Reportar un error"
+description: "Algo no funciona como debería"
+labels: ["bug"]
+body:
+  - type: dropdown
+    id: module
+    attributes:
+      label: "Módulo afectado"
+      options:
+        - Ventas / Facturación
+        - Compras
+        - Inventario
+        - Contabilidad
+        - Bancos
+        - Nómina / RRHH
+        - POS
+        - Restaurante
+        - Ecommerce
+        - CRM
+        - Logística
+        - Auditoría
+        - Fiscal
+        - Mobile
+        - Otro
+    validations:
+      required: true
+  - type: textarea
+    id: description
+    attributes:
+      label: "Descripción del error"
+      description: "Describe qué ocurre y qué esperabas que ocurriera"
+      placeholder: "Al intentar crear una factura, el sistema muestra..."
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: "Pasos para reproducir"
+      description: "¿Cómo podemos reproducir el error?"
+      placeholder: |
+        1. Ir a Ventas → Facturas
+        2. Hacer clic en Nueva Factura
+        3. Seleccionar un cliente
+        4. Ver el error
+    validations:
+      required: true
+  - type: dropdown
+    id: severity
+    attributes:
+      label: "Severidad"
+      options:
+        - "🔴 Crítico — No puedo trabajar"
+        - "🟠 Alto — Afecta mi operación"
+        - "🟡 Medio — Puedo seguir trabajando"
+        - "🟢 Bajo — Es cosmético o menor"
+    validations:
+      required: true
+  - type: input
+    id: company
+    attributes:
+      label: "Empresa"
+      placeholder: "Mi Empresa C.A."
+  - type: input
+    id: email
+    attributes:
+      label: "Email de contacto"
+      placeholder: "usuario@empresa.com"

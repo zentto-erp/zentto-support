@@ -1,0 +1,35 @@
+name: "❓ Pregunta"
+description: "Tienes una duda sobre cómo usar el sistema"
+labels: ["question"]
+body:
+  - type: dropdown
+    id: module
+    attributes:
+      label: "Módulo"
+      options:
+        - Ventas / Facturación
+        - Compras
+        - Inventario
+        - Contabilidad
+        - Bancos
+        - Nómina / RRHH
+        - POS
+        - Restaurante
+        - Ecommerce
+        - CRM
+        - Logística
+        - General
+    validations:
+      required: true
+  - type: textarea
+    id: question
+    attributes:
+      label: "Tu pregunta"
+      description: "¿Qué necesitas saber?"
+    validations:
+      required: true
+  - type: input
+    id: email
+    attributes:
+      label: "Email de contacto"
+      placeholder: "usuario@empresa.com"

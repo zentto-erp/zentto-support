@@ -1,0 +1,44 @@
+name: "✨ Solicitar funcionalidad"
+description: "Sugiere una mejora o nueva funcionalidad"
+labels: ["feature"]
+body:
+  - type: dropdown
+    id: module
+    attributes:
+      label: "Módulo relacionado"
+      options:
+        - Ventas / Facturación
+        - Compras
+        - Inventario
+        - Contabilidad
+        - Bancos
+        - Nómina / RRHH
+        - POS
+        - Restaurante
+        - Ecommerce
+        - CRM
+        - Logística
+        - Auditoría
+        - Fiscal
+        - Mobile
+        - Nuevo módulo
+        - General
+    validations:
+      required: true
+  - type: textarea
+    id: description
+    attributes:
+      label: "¿Qué necesitas?"
+      description: "Describe la funcionalidad que te gustaría ver"
+    validations:
+      required: true
+  - type: textarea
+    id: use_case
+    attributes:
+      label: "Caso de uso"
+      description: "¿Cómo usarías esta funcionalidad en tu día a día?"
+  - type: input
+    id: company
+    attributes:
+      label: "Empresa"
+      placeholder: "Mi Empresa C.A."
