@@ -77,7 +77,7 @@ jobs:
             # Get frontend components
             if [ -d "web/modular-frontend/packages/module-$MODULE/src" ]; then
               CONTEXT="$CONTEXT\n--- FRONTEND: module-$MODULE ---\n"
-              for f in web/modular-frontend/packages/module-$MODULE/src/*.{ts,tsx} 2>/dev/null; do
+              for f in $(find web/modular-frontend/packages/module-$MODULE/src -maxdepth 1 -name "*.ts" -o -name "*.tsx" 2>/dev/null); do
                 [ -f "$f" ] && CONTEXT="$CONTEXT\n--- $f ---\n$(head -80 $f)"
               done
             fi

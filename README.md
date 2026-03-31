@@ -29,3 +29,5 @@ Bienvenido al centro de soporte de **Zentto ERP**. Aquí puedes:
 
 ---
 *Zentto · Hecho para PYMEs que crecen*
+
+<!-- version: 2026-03-31T13:03:34.163Z -->
