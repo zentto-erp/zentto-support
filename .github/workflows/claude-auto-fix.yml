@@ -45,7 +45,7 @@ jobs:
                 '---',
                 '_Issue creado automaticamente desde el repositorio de soporte._'
               ].join('\n'),
-              labels: ['support', 'ai-generated']
+              labels: ['support', 'pending-fix']
             });
 
             await github.rest.issues.createComment({
