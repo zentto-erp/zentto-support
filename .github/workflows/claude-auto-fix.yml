@@ -6,12 +6,10 @@ on:
 
 jobs:
   analyze-and-fix:
-    # Solo se activa cuando se agrega la etiqueta "ai-fix"
     if: github.event.label.name == 'ai-fix'
     runs-on: ubuntu-latest
     permissions:
       issues: write
-
     steps:
       - name: Comment — Analyzing
         uses: actions/github-script@v7
@@ -21,10 +19,10 @@ jobs:
               owner: context.repo.owner,
               repo: context.repo.repo,
               issue_number: context.issue.number,
-              body: '🤖 **Claude está analizando este ticket...**\n\nRevisando el código fuente para encontrar una solución. Esto puede tomar unos minutos.'
+              body: '🤖 **Claude está analizando este ticket...**\n\nRevisando el código fuente para encontrar una solución.'
             });
 
-      - name: Checkout code repo
+      - name: Checkout zentto-web
         uses: actions/checkout@v4
         with:
           repository: zentto-erp/zentto-web
@@ -36,8 +34,7 @@ jobs:
         with:
           node-version: 22
 
-      - name: Analyze with Claude and create fix
-        id: claude-fix
+      - name: Analyze with Claude
         env:
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
           ISSUE_TITLE: ${{ github.event.issue.title }}
@@ -46,107 +43,92 @@ jobs:
           ISSUE_LABELS: ${{ join(github.event.issue.labels.*.name, ',') }}
         run: |
           cd zentto-web
+          node << 'SCRIPT'
+          const https = require("https");
+          const fs = require("fs");
+          const path = require("path");
 
-          # Detect module from labels
-          MODULE=""
-          for label in $(echo "$ISSUE_LABELS" | tr ',' '\n'); do
-            case "$label" in
-              modulo:*) MODULE="${label#modulo:}" ;;
-            esac
-          done
+          const labels = (process.env.ISSUE_LABELS || "").split(",");
+          const mod = labels.find(l => l.startsWith("modulo:"))?.replace("modulo:", "") || "";
+          const type = labels.includes("feature") ? "feature" : labels.includes("question") ? "question" : "bug";
 
-          # Detect if bug or feature
-          TYPE="bug"
-          echo "$ISSUE_LABELS" | grep -q "feature" && TYPE="feature"
-          echo "$ISSUE_LABELS" | grep -q "question" && TYPE="question"
-
-          # Gather relevant code context
-          CONTEXT=""
-          if [ -n "$MODULE" ]; then
-            # Get API module files
-            if [ -d "web/api/src/modules/$MODULE" ]; then
-              CONTEXT="$CONTEXT\n\n--- API MODULE: $MODULE ---\n"
-              for f in web/api/src/modules/$MODULE/*.ts; do
-                [ -f "$f" ] && CONTEXT="$CONTEXT\n--- $f ---\n$(head -100 $f)"
-              done
-            fi
-            # Get SQL files
-            for sp in web/api/sqlweb/includes/sp/usp_${MODULE}*.sql; do
-              [ -f "$sp" ] && CONTEXT="$CONTEXT\n--- $sp ---\n$(head -80 $sp)"
-            done
-            # Get frontend components
-            if [ -d "web/modular-frontend/packages/module-$MODULE/src" ]; then
-              CONTEXT="$CONTEXT\n--- FRONTEND: module-$MODULE ---\n"
-              for f in $(find web/modular-frontend/packages/module-$MODULE/src -maxdepth 1 -name "*.ts" -o -name "*.tsx" 2>/dev/null); do
-                [ -f "$f" ] && CONTEXT="$CONTEXT\n--- $f ---\n$(head -80 $f)"
-              done
-            fi
-          fi
-
-          # If no module-specific context, get general structure
-          if [ -z "$CONTEXT" ]; then
-            CONTEXT="API modules: $(ls web/api/src/modules/ | tr '\n' ', ')"
-            CONTEXT="$CONTEXT\nFrontend apps: $(ls web/modular-frontend/apps/ | tr '\n' ', ')"
-          fi
-
-          # Call Claude API
-          RESPONSE=$(curl -s https://api.anthropic.com/v1/messages \
-            -H "x-api-key: $ANTHROPIC_API_KEY" \
-            -H "anthropic-version: 2023-06-01" \
-            -H "content-type: application/json" \
-            -d "$(cat <<PROMPT
-          {
-            "model": "claude-sonnet-4-20250514",
-            "max_tokens": 4096,
-            "messages": [{
-              "role": "user",
-              "content": "You are a senior developer for Zentto ERP (Node.js + Express + TypeScript API, Next.js frontend, SQL Server + PostgreSQL dual-database).\n\nA support ticket was created:\n\n**Title:** ${ISSUE_TITLE}\n\n**Body:**\n${ISSUE_BODY}\n\n**Type:** ${TYPE}\n**Module:** ${MODULE:-general}\n**Labels:** ${ISSUE_LABELS}\n\n**Relevant code context:**\n${CONTEXT}\n\nAnalyze this ticket and provide:\n1. **Root cause analysis** (if bug) or **feasibility assessment** (if feature)\n2. **Affected files** — list exact file paths that need changes\n3. **Proposed solution** — describe the fix step by step\n4. **Risk level** (low/medium/high) and testing recommendations\n5. **Estimated effort** (trivial/small/medium/large)\n\nRespond in Spanish. Be specific about file paths and code changes. If you can't determine the fix from the context, say so and suggest what additional information is needed."
-            }]
+          let context = "";
+          if (mod) {
+            const apiDir = "web/api/src/modules/" + mod;
+            if (fs.existsSync(apiDir)) {
+              context += "\n--- API MODULE: " + mod + " ---\n";
+              fs.readdirSync(apiDir).filter(f => f.endsWith(".ts")).slice(0, 5).forEach(f => {
+                context += "\n--- " + f + " ---\n" + fs.readFileSync(path.join(apiDir, f), "utf8").split("\n").slice(0, 100).join("\n");
+              });
+            }
+            const feDir = "web/modular-frontend/packages/module-" + mod + "/src/components";
+            if (fs.existsSync(feDir)) {
+              context += "\n--- FRONTEND ---\n";
+              fs.readdirSync(feDir).filter(f => f.endsWith(".tsx")).slice(0, 3).forEach(f => {
+                context += "\n--- " + f + " ---\n" + fs.readFileSync(path.join(feDir, f), "utf8").split("\n").slice(0, 80).join("\n");
+              });
+            }
           }
-          PROMPT
-          )")
+          if (!context) {
+            try { context = "API modules: " + fs.readdirSync("web/api/src/modules").join(", "); } catch {}
+          }
 
-          # Extract Claude's analysis
-          ANALYSIS=$(echo "$RESPONSE" | node -e "
-            const data = JSON.parse(require('fs').readFileSync('/dev/stdin','utf8'));
-            const text = data.content?.[0]?.text || 'Error al analizar el ticket';
-            console.log(text);
-          ")
+          const prompt = [
+            "You are a senior developer for Zentto ERP.",
+            "Title: " + process.env.ISSUE_TITLE,
+            "Body:\n" + process.env.ISSUE_BODY,
+            "Type: " + type + " | Module: " + (mod || "general"),
+            "Context:\n" + context,
+            "",
+            "Provide: 1) Root cause 2) Affected files 3) Solution 4) Risk level 5) Effort",
+            "Respond in Spanish."
+          ].join("\n\n");
 
-          echo "ANALYSIS<<EOF" >> $GITHUB_OUTPUT
-          echo "$ANALYSIS" >> $GITHUB_OUTPUT
-          echo "EOF" >> $GITHUB_OUTPUT
-          echo "TYPE=$TYPE" >> $GITHUB_OUTPUT
-          echo "MODULE=$MODULE" >> $GITHUB_OUTPUT
+          const body = JSON.stringify({
+            model: "claude-sonnet-4-20250514",
+            max_tokens: 4096,
+            messages: [{ role: "user", content: prompt }]
+          });
 
-      - name: Comment — Analysis result
+          const req = https.request({
+            hostname: "api.anthropic.com",
+            path: "/v1/messages",
+            method: "POST",
+            headers: {
+              "x-api-key": process.env.ANTHROPIC_API_KEY,
+              "anthropic-version": "2023-06-01",
+              "content-type": "application/json",
+            }
+          }, res => {
+            let data = "";
+            res.on("data", c => data += c);
+            res.on("end", () => {
+              try {
+                const text = JSON.parse(data).content[0].text;
+                fs.writeFileSync("/tmp/analysis.txt", text);
+              } catch (e) {
+                fs.writeFileSync("/tmp/analysis.txt", "Error: " + e.message + "\nRaw: " + data.substring(0, 500));
+              }
+            });
+          });
+          req.on("error", e => fs.writeFileSync("/tmp/analysis.txt", "API error: " + e.message));
+          req.write(body);
+          req.end();
+          SCRIPT
+
+      - name: Post analysis comment
         uses: actions/github-script@v7
         with:
           script: |
-            const analysis = `${{ steps.claude-fix.outputs.ANALYSIS }}`;
-            const type = `${{ steps.claude-fix.outputs.TYPE }}`;
-            const module = `${{ steps.claude-fix.outputs.MODULE }}`;
-
-            const body = [
-              '## 🤖 Análisis de Claude\n',
-              analysis,
-              '\n---',
-              `**Tipo:** ${type} | **Módulo:** ${module || 'general'}`,
-              '',
-              '### Próximos pasos',
-              '- Si el análisis es correcto, agrega la etiqueta `ai-pr` para que Claude cree un PR con el fix',
-              '- Si necesita más contexto, comenta con la información adicional y vuelve a agregar `ai-fix`',
-              '- Para asignar a un humano, quita `ai-fix` y asigna manualmente',
-            ].join('\n');
-
+            const fs = require('fs');
+            let analysis = 'Error: analysis not generated';
+            try { analysis = fs.readFileSync('/tmp/analysis.txt', 'utf8').trim(); } catch {}
             await github.rest.issues.createComment({
               owner: context.repo.owner,
               repo: context.repo.repo,
               issue_number: context.issue.number,
-              body: body
+              body: '## 🤖 Análisis de Claude\n\n' + analysis + '\n\n---\n### Próximos pasos\n- Agrega `ai-pr` para que Claude cree un PR con el fix\n- O asigna manualmente a un desarrollador'
             });
-
-            // Add label to indicate analysis is done
             await github.rest.issues.addLabels({
               owner: context.repo.owner,
               repo: context.repo.repo,
@@ -155,12 +137,10 @@ jobs:
             });
 
   create-pr:
-    # Se activa cuando se agrega "ai-pr" (después de revisar el análisis)
     if: github.event.label.name == 'ai-pr'
     runs-on: ubuntu-latest
     permissions:
       issues: write
-
     steps:
       - name: Comment — Creating PR
         uses: actions/github-script@v7
@@ -170,14 +150,15 @@ jobs:
               owner: context.repo.owner,
               repo: context.repo.repo,
               issue_number: context.issue.number,
-              body: '🔧 **Claude está creando un PR con la solución...**\n\nGenerando código y abriendo Pull Request en el repositorio principal.'
+              body: '🔧 **Claude está creando un PR con la solución...**'
             });
 
-      - name: Checkout code repo
+      - name: Checkout zentto-web
         uses: actions/checkout@v4
         with:
           repository: zentto-erp/zentto-web
           token: ${{ secrets.GH_PAT }}
+          ref: developer
           path: zentto-web
 
       - name: Setup Node
@@ -185,8 +166,8 @@ jobs:
         with:
           node-version: 22
 
-      - name: Get issue comments for context
-        id: get-context
+      - name: Get analysis from comments
+        id: ctx
         uses: actions/github-script@v7
         with:
           script: |
@@ -195,158 +176,133 @@ jobs:
               repo: context.repo.repo,
               issue_number: context.issue.number,
             });
-
-            // Find Claude's analysis comment
             const analysis = comments.data
               .filter(c => c.body.includes('Análisis de Claude'))
-              .map(c => c.body)
-              .join('\n');
-
+              .map(c => c.body).join('\n');
             core.setOutput('analysis', analysis);
             core.setOutput('title', context.payload.issue.title);
             core.setOutput('body', context.payload.issue.body);
-            core.setOutput('number', context.payload.issue.number);
+            core.setOutput('number', String(context.payload.issue.number));
 
-      - name: Generate fix with Claude
-        id: generate
+      - name: Generate fix
+        id: gen
         env:
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
-          ISSUE_TITLE: ${{ steps.get-context.outputs.title }}
-          ISSUE_BODY: ${{ steps.get-context.outputs.body }}
-          ISSUE_NUMBER: ${{ steps.get-context.outputs.number }}
-          ANALYSIS: ${{ steps.get-context.outputs.analysis }}
+          ISSUE_TITLE: ${{ steps.ctx.outputs.title }}
+          ISSUE_BODY: ${{ steps.ctx.outputs.body }}
+          ISSUE_NUMBER: ${{ steps.ctx.outputs.number }}
+          ANALYSIS: ${{ steps.ctx.outputs.analysis }}
         run: |
           cd zentto-web
           BRANCH="fix/support-issue-${ISSUE_NUMBER}"
           git checkout -b "$BRANCH"
 
-          # Call Claude to generate the actual code changes
-          RESPONSE=$(curl -s https://api.anthropic.com/v1/messages \
-            -H "x-api-key: $ANTHROPIC_API_KEY" \
-            -H "anthropic-version: 2023-06-01" \
-            -H "content-type: application/json" \
-            -d "$(cat <<PROMPT
-          {
-            "model": "claude-sonnet-4-20250514",
-            "max_tokens": 8192,
-            "messages": [{
-              "role": "user",
-              "content": "You are implementing a fix for Zentto ERP. Generate ONLY the file changes needed.\n\nIssue: ${ISSUE_TITLE}\n\nAnalysis:\n${ANALYSIS}\n\nIMPORTANT RULES:\n- Output ONLY in this JSON format: {\"files\": [{\"path\": \"relative/path\", \"action\": \"create|modify|delete\", \"content\": \"full file content\"}]}\n- Use real file paths relative to the repo root\n- For modifications, include the COMPLETE new file content\n- Follow existing code patterns (TypeScript strict, Express routes, callSp/callSpOut helpers)\n- If SQL changes, include BOTH sqlweb/ AND sqlweb-pg/ versions\n- Do NOT include explanations, only the JSON\n- If you cannot generate a fix, return {\"files\": [], \"reason\": \"explanation\"}"
-            }]
-          }
-          PROMPT
-          )")
+          node << 'SCRIPT'
+          const https = require("https");
+          const fs = require("fs");
+          const path = require("path");
 
-          # Parse and apply changes
-          echo "$RESPONSE" | node -e "
-            const fs = require('fs');
-            const path = require('path');
-            const data = JSON.parse(fs.readFileSync('/dev/stdin','utf8'));
-            const text = data.content?.[0]?.text || '{}';
+          const prompt = [
+            "Implement a fix for Zentto ERP.",
+            "Issue: " + process.env.ISSUE_TITLE,
+            "Analysis: " + process.env.ANALYSIS,
+            "",
+            'Output ONLY valid JSON: {"files": [{"path": "relative/path", "action": "create|modify", "content": "full content"}]}',
+            'If cannot fix, return: {"files": [], "reason": "explanation"}'
+          ].join("\n");
 
-            try {
-              // Extract JSON from response (might have markdown wrapping)
-              const jsonMatch = text.match(/\{[\s\S]*\}/);
-              if (!jsonMatch) { console.log('NO_CHANGES'); process.exit(0); }
+          const body = JSON.stringify({
+            model: "claude-sonnet-4-20250514",
+            max_tokens: 8192,
+            messages: [{ role: "user", content: prompt }]
+          });
 
-              const changes = JSON.parse(jsonMatch[0]);
-              if (!changes.files || changes.files.length === 0) {
-                console.log('NO_CHANGES: ' + (changes.reason || 'No fix generated'));
-                process.exit(0);
-              }
-
-              let count = 0;
-              for (const file of changes.files) {
-                if (file.action === 'delete') {
-                  if (fs.existsSync(file.path)) fs.unlinkSync(file.path);
-                } else {
-                  const dir = path.dirname(file.path);
-                  fs.mkdirSync(dir, { recursive: true });
-                  fs.writeFileSync(file.path, file.content);
-                }
-                count++;
-                console.log(file.action + ': ' + file.path);
-              }
-              console.log('CHANGES_APPLIED: ' + count);
-            } catch(e) {
-              console.log('PARSE_ERROR: ' + e.message);
+          const req = https.request({
+            hostname: "api.anthropic.com",
+            path: "/v1/messages",
+            method: "POST",
+            headers: {
+              "x-api-key": process.env.ANTHROPIC_API_KEY,
+              "anthropic-version": "2023-06-01",
+              "content-type": "application/json",
             }
-          " | tee /tmp/changes.log
+          }, res => {
+            let data = "";
+            res.on("data", c => data += c);
+            res.on("end", () => {
+              try {
+                const text = JSON.parse(data).content[0].text;
+                const match = text.match(/\{[\s\S]*\}/);
+                if (!match) { fs.writeFileSync("/tmp/has_changes", "false"); return; }
+                const changes = JSON.parse(match[0]);
+                if (!changes.files || changes.files.length === 0) {
+                  fs.writeFileSync("/tmp/has_changes", "false");
+                  return;
+                }
+                for (const file of changes.files) {
+                  if (file.action === "delete" && fs.existsSync(file.path)) {
+                    fs.unlinkSync(file.path);
+                  } else {
+                    fs.mkdirSync(path.dirname(file.path), { recursive: true });
+                    fs.writeFileSync(file.path, file.content);
+                  }
+                  console.log(file.action + ": " + file.path);
+                }
+                fs.writeFileSync("/tmp/has_changes", "true");
+              } catch (e) {
+                console.log("Error: " + e.message);
+                fs.writeFileSync("/tmp/has_changes", "false");
+              }
+            });
+          });
+          req.on("error", () => fs.writeFileSync("/tmp/has_changes", "false"));
+          req.write(body);
+          req.end();
+          SCRIPT
 
-          CHANGES=$(grep -c "CHANGES_APPLIED" /tmp/changes.log || echo "0")
-
-          if [ "$CHANGES" = "0" ]; then
-            echo "has_changes=false" >> $GITHUB_OUTPUT
-            echo "No changes generated"
-          else
+          sleep 10
+          HAS=$(cat /tmp/has_changes 2>/dev/null || echo "false")
+          if [ "$HAS" = "true" ]; then
             git add -A
-            git diff --cached --stat
-            git commit -m "fix: resolve support issue #${ISSUE_NUMBER} — ${ISSUE_TITLE}"
+            git commit -m "fix: resolve support issue #${ISSUE_NUMBER}"
             git push origin "$BRANCH"
             echo "has_changes=true" >> $GITHUB_OUTPUT
             echo "branch=$BRANCH" >> $GITHUB_OUTPUT
+          else
+            echo "has_changes=false" >> $GITHUB_OUTPUT
           fi
 
-      - name: Create Pull Request
-        if: steps.generate.outputs.has_changes == 'true'
+      - name: Create Draft PR
+        if: steps.gen.outputs.has_changes == 'true'
         uses: actions/github-script@v7
-        env:
-          GH_PAT: ${{ secrets.GH_PAT }}
         with:
           github-token: ${{ secrets.GH_PAT }}
           script: |
-            const branch = '${{ steps.generate.outputs.branch }}';
-            const issueNumber = ${{ steps.get-context.outputs.number }};
-            const issueTitle = `${{ steps.get-context.outputs.title }}`;
-
+            const branch = '${{ steps.gen.outputs.branch }}';
+            const num = ${{ steps.ctx.outputs.number }};
+            const title = `${{ steps.ctx.outputs.title }}`;
             const pr = await github.rest.pulls.create({
-              owner: 'zentto-erp',
-              repo: 'zentto-web',
-              title: `fix: ${issueTitle} (support #${issueNumber})`,
-              body: [
-                `## Resolución automática — Support #${issueNumber}`,
-                '',
-                `Ticket: https://github.com/zentto-erp/zentto-support/issues/${issueNumber}`,
-                '',
-                '### Cambios generados por Claude',
-                '',
-                '> ⚠️ **Esta PR fue generada automáticamente.** Revisar antes de mergear.',
-                '',
-                '### Checklist',
-                '- [ ] Código revisado por un humano',
-                '- [ ] Tests pasan correctamente',
-                '- [ ] SQL actualizado en AMBOS motores (sqlweb + sqlweb-pg)',
-                '- [ ] No hay secretos expuestos',
-              ].join('\n'),
-              head: branch,
-              base: 'main',
-              draft: true,
+              owner: 'zentto-erp', repo: 'zentto-web',
+              title: `fix: ${title} (support #${num})`,
+              body: `## Support #${num}\n\n> ⚠️ PR generada automáticamente. Revisar antes de mergear.`,
+              head: branch, base: 'developer', draft: true,
             });
-
-            // Comment on the support issue with PR link
-            const octokit = github.getOctokit(process.env.GH_PAT);
             await github.rest.issues.createComment({
-              owner: 'zentto-erp',
-              repo: 'zentto-support',
-              issue_number: issueNumber,
-              body: `✅ **PR creado:** [zentto-web#${pr.data.number}](${pr.data.html_url})\n\nRevisar y mergear cuando esté listo. La PR está en modo **draft**.`
+              owner: 'zentto-erp', repo: 'zentto-support', issue_number: num,
+              body: `✅ **PR:** [zentto-web#${pr.data.number}](${pr.data.html_url}) (draft)`
             });
-
             await github.rest.issues.addLabels({
-              owner: 'zentto-erp',
-              repo: 'zentto-support',
-              issue_number: issueNumber,
-              labels: ['estado:en-progreso']
+              owner: 'zentto-erp', repo: 'zentto-support', issue_number: num,
+              labels: ['ai-pr']
             });
 
-      - name: Comment — No changes
-        if: steps.generate.outputs.has_changes != 'true'
+      - name: No changes
+        if: steps.gen.outputs.has_changes != 'true'
         uses: actions/github-script@v7
         with:
           script: |
             await github.rest.issues.createComment({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
+              owner: context.repo.owner, repo: context.repo.repo,
               issue_number: context.issue.number,
-              body: '⚠️ **Claude no pudo generar un fix automático.**\n\nEste ticket requiere intervención manual. Se recomienda asignar a un desarrollador.'
+              body: '⚠️ Claude no pudo generar un fix automático. Asignar manualmente.'
             });
