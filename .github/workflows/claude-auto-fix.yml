@@ -19,7 +19,7 @@ jobs:
               owner: context.repo.owner,
               repo: context.repo.repo,
               issue_number: context.issue.number,
-              body: '🤖 **Claude está analizando este ticket...**\n\nRevisando el código fuente para encontrar una solución.'
+              body: '🤖 **Claude está analizando este ticket...**\n\nRevisando el código fuente para encontrar una solución. Esto puede tomar unos minutos.'
             });
 
       - name: Checkout zentto-web
@@ -29,8 +29,7 @@ jobs:
           token: ${{ secrets.GH_PAT }}
           path: zentto-web
 
-      - name: Setup Node
-        uses: actions/setup-node@v4
+      - uses: actions/setup-node@v4
         with:
           node-version: 22
 
@@ -63,8 +62,8 @@ jobs:
             }
             const feDir = "web/modular-frontend/packages/module-" + mod + "/src/components";
             if (fs.existsSync(feDir)) {
-              context += "\n--- FRONTEND ---\n";
-              fs.readdirSync(feDir).filter(f => f.endsWith(".tsx")).slice(0, 3).forEach(f => {
+              context += "\n--- FRONTEND: module-" + mod + " ---\n";
+              fs.readdirSync(feDir).filter(f => f.endsWith(".tsx")).slice(0, 5).forEach(f => {
                 context += "\n--- " + f + " ---\n" + fs.readFileSync(path.join(feDir, f), "utf8").split("\n").slice(0, 80).join("\n");
               });
             }
@@ -74,15 +73,20 @@ jobs:
           }
 
           const prompt = [
-            "You are a senior developer for Zentto ERP.",
+            "You are a senior developer for Zentto ERP (Node.js + Express + TypeScript API, Next.js frontend, SQL Server + PostgreSQL dual-database).",
+            "",
+            "A support ticket was created:",
             "Title: " + process.env.ISSUE_TITLE,
             "Body:\n" + process.env.ISSUE_BODY,
             "Type: " + type + " | Module: " + (mod || "general"),
-            "Context:\n" + context,
             "",
-            "Provide: 1) Root cause 2) Affected files 3) Solution 4) Risk level 5) Effort",
-            "Respond in Spanish."
-          ].join("\n\n");
+            "Relevant code context:\n" + context,
+            "",
+            "Respond with a JSON object (no markdown wrapping) with these fields:",
+            '{"summary": "1-2 sentence summary for the customer (NO code, NO file paths)", "cause": "root cause explanation for developers", "affected_files": ["list of file paths"], "solution": "detailed technical solution with code snippets", "risk": "low|medium|high", "effort": "trivial|small|medium|large"}',
+            "",
+            "IMPORTANT: The summary field must be SHORT and non-technical (shown to customers). All technical details go in cause/solution fields (shown only to developers). Respond in Spanish."
+          ].join("\n");
 
           const body = JSON.stringify({
             model: "claude-sonnet-4-20250514",
@@ -105,30 +109,94 @@ jobs:
             res.on("end", () => {
               try {
                 const text = JSON.parse(data).content[0].text;
-                fs.writeFileSync("/tmp/analysis.txt", text);
+                const jsonMatch = text.match(/\{[\s\S]*\}/);
+                if (jsonMatch) {
+                  fs.writeFileSync("/tmp/analysis.json", jsonMatch[0]);
+                } else {
+                  fs.writeFileSync("/tmp/analysis.json", JSON.stringify({ summary: text.substring(0, 200), cause: text, affected_files: [], solution: text, risk: "medium", effort: "medium" }));
+                }
               } catch (e) {
-                fs.writeFileSync("/tmp/analysis.txt", "Error: " + e.message + "\nRaw: " + data.substring(0, 500));
+                fs.writeFileSync("/tmp/analysis.json", JSON.stringify({ summary: "Error en el análisis: " + e.message, cause: "Error: " + data.substring(0, 500), affected_files: [], solution: "", risk: "unknown", effort: "unknown" }));
               }
             });
           });
-          req.on("error", e => fs.writeFileSync("/tmp/analysis.txt", "API error: " + e.message));
+          req.on("error", e => {
+            fs.writeFileSync("/tmp/analysis.json", JSON.stringify({ summary: "Error de conexión con el servicio de análisis", cause: e.message, affected_files: [], solution: "", risk: "unknown", effort: "unknown" }));
+          });
           req.write(body);
           req.end();
           SCRIPT
 
-      - name: Post analysis comment
+      - name: Post summary on support (short, no code)
         uses: actions/github-script@v7
         with:
           script: |
             const fs = require('fs');
-            let analysis = 'Error: analysis not generated';
-            try { analysis = fs.readFileSync('/tmp/analysis.txt', 'utf8').trim(); } catch {}
+            let analysis = { summary: 'Error al generar análisis', risk: 'unknown', effort: 'unknown' };
+            try { analysis = JSON.parse(fs.readFileSync('/tmp/analysis.json', 'utf8')); } catch {}
+
             await github.rest.issues.createComment({
               owner: context.repo.owner,
               repo: context.repo.repo,
               issue_number: context.issue.number,
-              body: '## 🤖 Análisis de Claude\n\n' + analysis + '\n\n---\n### Próximos pasos\n- Agrega `ai-pr` para que Claude cree un PR con el fix\n- O asigna manualmente a un desarrollador'
+              body: [
+                '## 🤖 Análisis completado',
+                '',
+                analysis.summary,
+                '',
+                `**Riesgo:** ${analysis.risk} | **Esfuerzo:** ${analysis.effort}`,
+                '',
+                'El equipo técnico ha sido notificado. Se creará una solución en el repositorio de desarrollo.',
+                '',
+                '---',
+                '_Para acelerar la resolución, agrega la etiqueta `ai-pr` cuando el equipo apruebe el análisis._'
+              ].join('\n')
             });
+
+      - name: Create technical issue on zentto-web
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.GH_PAT }}
+          script: |
+            const fs = require('fs');
+            let analysis = { cause: 'N/A', affected_files: [], solution: 'N/A', risk: 'unknown', effort: 'unknown', summary: '' };
+            try { analysis = JSON.parse(fs.readFileSync('/tmp/analysis.json', 'utf8')); } catch {}
+
+            const supportUrl = `https://github.com/${context.repo.owner}/${context.repo.repo}/issues/${context.issue.number}`;
+            const title = context.payload.issue.title;
+
+            const issue = await github.rest.issues.create({
+              owner: 'zentto-erp',
+              repo: 'zentto-web',
+              title: `[Support #${context.issue.number}] ${title}`,
+              body: [
+                `## Origen: [Support Ticket #${context.issue.number}](${supportUrl})`,
+                '',
+                '## Causa raíz',
+                analysis.cause,
+                '',
+                '## Archivos afectados',
+                (analysis.affected_files || []).map(f => '- `' + f + '`').join('\n') || '_No identificados_',
+                '',
+                '## Solución propuesta',
+                analysis.solution,
+                '',
+                `**Riesgo:** ${analysis.risk} | **Esfuerzo:** ${analysis.effort}`,
+                '',
+                '---',
+                '_Issue creado automáticamente por el agente de soporte AI._'
+              ].join('\n'),
+              labels: ['ai-generated', 'support']
+            });
+
+            // Comment on support issue with link to technical issue
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              body: `📋 Issue técnico creado: [zentto-web#${issue.data.number}](${issue.data.html_url})`
+            });
+
             await github.rest.issues.addLabels({
               owner: context.repo.owner,
               repo: context.repo.repo,
@@ -150,7 +218,7 @@ jobs:
               owner: context.repo.owner,
               repo: context.repo.repo,
               issue_number: context.issue.number,
-              body: '🔧 **Claude está creando un PR con la solución...**'
+              body: '🔧 **Creando solución...**\n\nGenerando código y abriendo Pull Request en el repositorio de desarrollo.'
             });
 
       - name: Checkout zentto-web
@@ -161,35 +229,48 @@ jobs:
           ref: developer
           path: zentto-web
 
-      - name: Setup Node
-        uses: actions/setup-node@v4
+      - uses: actions/setup-node@v4
         with:
           node-version: 22
 
-      - name: Get analysis from comments
+      - name: Get analysis context
         id: ctx
         uses: actions/github-script@v7
         with:
+          github-token: ${{ secrets.GH_PAT }}
           script: |
+            // Find the zentto-web issue linked from comments
             const comments = await github.rest.issues.listComments({
               owner: context.repo.owner,
               repo: context.repo.repo,
               issue_number: context.issue.number,
             });
-            const analysis = comments.data
-              .filter(c => c.body.includes('Análisis de Claude'))
-              .map(c => c.body).join('\n');
-            core.setOutput('analysis', analysis);
+
+            let webIssueNumber = null;
+            for (const c of comments.data) {
+              const match = c.body.match(/zentto-web#(\d+)/);
+              if (match) { webIssueNumber = match[1]; break; }
+            }
+
+            let analysis = '';
+            if (webIssueNumber) {
+              const webIssue = await github.rest.issues.get({
+                owner: 'zentto-erp',
+                repo: 'zentto-web',
+                issue_number: parseInt(webIssueNumber),
+              });
+              analysis = webIssue.data.body;
+            }
+
+            core.setOutput('analysis', analysis || comments.data.map(c => c.body).join('\n'));
             core.setOutput('title', context.payload.issue.title);
-            core.setOutput('body', context.payload.issue.body);
             core.setOutput('number', String(context.payload.issue.number));
 
-      - name: Generate fix
+      - name: Generate fix with Claude
         id: gen
         env:
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
           ISSUE_TITLE: ${{ steps.ctx.outputs.title }}
-          ISSUE_BODY: ${{ steps.ctx.outputs.body }}
           ISSUE_NUMBER: ${{ steps.ctx.outputs.number }}
           ANALYSIS: ${{ steps.ctx.outputs.analysis }}
         run: |
@@ -203,12 +284,20 @@ jobs:
           const path = require("path");
 
           const prompt = [
-            "Implement a fix for Zentto ERP.",
-            "Issue: " + process.env.ISSUE_TITLE,
-            "Analysis: " + process.env.ANALYSIS,
+            "You are implementing a fix for Zentto ERP. The repo uses Node.js + Express + TypeScript for the API and Next.js for the frontend.",
             "",
-            'Output ONLY valid JSON: {"files": [{"path": "relative/path", "action": "create|modify", "content": "full content"}]}',
-            'If cannot fix, return: {"files": [], "reason": "explanation"}'
+            "Issue: " + process.env.ISSUE_TITLE,
+            "",
+            "Technical Analysis:",
+            process.env.ANALYSIS,
+            "",
+            'Output ONLY valid JSON (no markdown wrapping): {"files": [{"path": "relative/path/from/repo/root", "action": "create|modify", "content": "COMPLETE file content"}]}',
+            "RULES:",
+            "- Use real file paths relative to repo root",
+            "- For modifications, include the COMPLETE new file content",
+            "- Follow existing code patterns (TypeScript, Express routes, callSp helpers)",
+            "- If SQL changes needed, include BOTH sqlweb/ AND sqlweb-pg/ versions",
+            '- If you cannot generate a fix, return {"files": [], "reason": "explanation"}'
           ].join("\n");
 
           const body = JSON.stringify({
@@ -260,7 +349,7 @@ jobs:
           req.end();
           SCRIPT
 
-          sleep 10
+          sleep 15
           HAS=$(cat /tmp/has_changes 2>/dev/null || echo "false")
           if [ "$HAS" = "true" ]; then
             git add -A
@@ -284,19 +373,15 @@ jobs:
             const pr = await github.rest.pulls.create({
               owner: 'zentto-erp', repo: 'zentto-web',
               title: `fix: ${title} (support #${num})`,
-              body: `## Support #${num}\n\n> ⚠️ PR generada automáticamente. Revisar antes de mergear.`,
+              body: `## Support #${num}\n\nTicket: https://github.com/zentto-erp/zentto-support/issues/${num}\n\n> ⚠️ **PR generada automáticamente.** Revisar antes de mergear.\n\n### Checklist\n- [ ] Código revisado\n- [ ] Tests pasan\n- [ ] SQL en ambos motores`,
               head: branch, base: 'developer', draft: true,
             });
             await github.rest.issues.createComment({
               owner: 'zentto-erp', repo: 'zentto-support', issue_number: num,
-              body: `✅ **PR:** [zentto-web#${pr.data.number}](${pr.data.html_url}) (draft)`
-            });
-            await github.rest.issues.addLabels({
-              owner: 'zentto-erp', repo: 'zentto-support', issue_number: num,
-              labels: ['ai-pr']
+              body: `✅ **Solución creada:** [PR zentto-web#${pr.data.number}](${pr.data.html_url})\n\nLa solución está en revisión por el equipo de desarrollo.`
             });
 
-      - name: No changes
+      - name: No changes possible
         if: steps.gen.outputs.has_changes != 'true'
         uses: actions/github-script@v7
         with:
@@ -304,5 +389,5 @@ jobs:
             await github.rest.issues.createComment({
               owner: context.repo.owner, repo: context.repo.repo,
               issue_number: context.issue.number,
-              body: '⚠️ Claude no pudo generar un fix automático. Asignar manualmente.'
+              body: '⚠️ No fue posible generar una solución automática. El equipo de desarrollo revisará este caso manualmente.'
             });
