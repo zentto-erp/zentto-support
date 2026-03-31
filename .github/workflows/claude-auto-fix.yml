@@ -1,17 +1,17 @@
-name: Claude Auto-Fix
+name: Forward to Dev
 
 on:
   issues:
     types: [labeled]
 
 jobs:
-  analyze-and-fix:
+  forward-to-dev:
     if: github.event.label.name == 'ai-fix'
     runs-on: ubuntu-latest
     permissions:
       issues: write
     steps:
-      - name: Comment — Analyzing
+      - name: Acknowledge ticket
         uses: actions/github-script@v7
         with:
           script: |
@@ -19,182 +19,40 @@ jobs:
               owner: context.repo.owner,
               repo: context.repo.repo,
               issue_number: context.issue.number,
-              body: '🤖 **Claude está analizando este ticket...**\n\nRevisando el código fuente para encontrar una solución. Esto puede tomar unos minutos.'
+              body: 'Ticket registrado. El equipo tecnico ha sido notificado.'
             });
 
-      - name: Checkout zentto-web
-        uses: actions/checkout@v4
-        with:
-          repository: zentto-erp/zentto-web
-          token: ${{ secrets.GH_PAT }}
-          path: zentto-web
-
-      - uses: actions/setup-node@v4
-        with:
-          node-version: 22
-
-      - name: Analyze with Claude
-        env:
-          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
-          ISSUE_TITLE: ${{ github.event.issue.title }}
-          ISSUE_BODY: ${{ github.event.issue.body }}
-          ISSUE_NUMBER: ${{ github.event.issue.number }}
-          ISSUE_LABELS: ${{ join(github.event.issue.labels.*.name, ',') }}
-        run: |
-          cd zentto-web
-          node << 'SCRIPT'
-          const https = require("https");
-          const fs = require("fs");
-          const path = require("path");
-
-          const labels = (process.env.ISSUE_LABELS || "").split(",");
-          const mod = labels.find(l => l.startsWith("modulo:"))?.replace("modulo:", "") || "";
-          const type = labels.includes("feature") ? "feature" : labels.includes("question") ? "question" : "bug";
-
-          let context = "";
-          if (mod) {
-            const apiDir = "web/api/src/modules/" + mod;
-            if (fs.existsSync(apiDir)) {
-              context += "\n--- API MODULE: " + mod + " ---\n";
-              fs.readdirSync(apiDir).filter(f => f.endsWith(".ts")).slice(0, 5).forEach(f => {
-                context += "\n--- " + f + " ---\n" + fs.readFileSync(path.join(apiDir, f), "utf8").split("\n").slice(0, 100).join("\n");
-              });
-            }
-            const feDir = "web/modular-frontend/packages/module-" + mod + "/src/components";
-            if (fs.existsSync(feDir)) {
-              context += "\n--- FRONTEND: module-" + mod + " ---\n";
-              fs.readdirSync(feDir).filter(f => f.endsWith(".tsx")).slice(0, 5).forEach(f => {
-                context += "\n--- " + f + " ---\n" + fs.readFileSync(path.join(feDir, f), "utf8").split("\n").slice(0, 80).join("\n");
-              });
-            }
-          }
-          if (!context) {
-            try { context = "API modules: " + fs.readdirSync("web/api/src/modules").join(", "); } catch {}
-          }
-
-          const prompt = [
-            "You are a senior developer for Zentto ERP (Node.js + Express + TypeScript API, Next.js frontend, SQL Server + PostgreSQL dual-database).",
-            "",
-            "A support ticket was created:",
-            "Title: " + process.env.ISSUE_TITLE,
-            "Body:\n" + process.env.ISSUE_BODY,
-            "Type: " + type + " | Module: " + (mod || "general"),
-            "",
-            "Relevant code context:\n" + context,
-            "",
-            "Respond with a JSON object (no markdown wrapping) with these fields:",
-            '{"summary": "1-2 sentence summary for the customer (NO code, NO file paths)", "cause": "root cause explanation for developers", "affected_files": ["list of file paths"], "solution": "detailed technical solution with code snippets", "risk": "low|medium|high", "effort": "trivial|small|medium|large"}',
-            "",
-            "IMPORTANT: The summary field must be SHORT and non-technical (shown to customers). All technical details go in cause/solution fields (shown only to developers). Respond in Spanish."
-          ].join("\n");
-
-          const body = JSON.stringify({
-            model: "claude-sonnet-4-20250514",
-            max_tokens: 4096,
-            messages: [{ role: "user", content: prompt }]
-          });
-
-          const req = https.request({
-            hostname: "api.anthropic.com",
-            path: "/v1/messages",
-            method: "POST",
-            headers: {
-              "x-api-key": process.env.ANTHROPIC_API_KEY,
-              "anthropic-version": "2023-06-01",
-              "content-type": "application/json",
-            }
-          }, res => {
-            let data = "";
-            res.on("data", c => data += c);
-            res.on("end", () => {
-              try {
-                const text = JSON.parse(data).content[0].text;
-                const jsonMatch = text.match(/\{[\s\S]*\}/);
-                if (jsonMatch) {
-                  fs.writeFileSync("/tmp/analysis.json", jsonMatch[0]);
-                } else {
-                  fs.writeFileSync("/tmp/analysis.json", JSON.stringify({ summary: text.substring(0, 200), cause: text, affected_files: [], solution: text, risk: "medium", effort: "medium" }));
-                }
-              } catch (e) {
-                fs.writeFileSync("/tmp/analysis.json", JSON.stringify({ summary: "Error en el análisis: " + e.message, cause: "Error: " + data.substring(0, 500), affected_files: [], solution: "", risk: "unknown", effort: "unknown" }));
-              }
-            });
-          });
-          req.on("error", e => {
-            fs.writeFileSync("/tmp/analysis.json", JSON.stringify({ summary: "Error de conexión con el servicio de análisis", cause: e.message, affected_files: [], solution: "", risk: "unknown", effort: "unknown" }));
-          });
-          req.write(body);
-          req.end();
-          SCRIPT
-
-      - name: Post summary on support (short, no code)
-        uses: actions/github-script@v7
-        with:
-          script: |
-            const fs = require('fs');
-            let analysis = { summary: 'Error al generar análisis', risk: 'unknown', effort: 'unknown' };
-            try { analysis = JSON.parse(fs.readFileSync('/tmp/analysis.json', 'utf8')); } catch {}
-
-            await github.rest.issues.createComment({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              issue_number: context.issue.number,
-              body: [
-                '## 🤖 Análisis completado',
-                '',
-                analysis.summary,
-                '',
-                `**Riesgo:** ${analysis.risk} | **Esfuerzo:** ${analysis.effort}`,
-                '',
-                'El equipo técnico ha sido notificado. Se creará una solución en el repositorio de desarrollo.',
-                '',
-                '---',
-                '_Para acelerar la resolución, agrega la etiqueta `ai-pr` cuando el equipo apruebe el análisis._'
-              ].join('\n')
-            });
-
-      - name: Create technical issue on zentto-web
+      - name: Create issue on zentto-web and link back
         uses: actions/github-script@v7
         with:
           github-token: ${{ secrets.GH_PAT }}
           script: |
-            const fs = require('fs');
-            let analysis = { cause: 'N/A', affected_files: [], solution: 'N/A', risk: 'unknown', effort: 'unknown', summary: '' };
-            try { analysis = JSON.parse(fs.readFileSync('/tmp/analysis.json', 'utf8')); } catch {}
-
             const supportUrl = `https://github.com/${context.repo.owner}/${context.repo.repo}/issues/${context.issue.number}`;
-            const title = context.payload.issue.title;
+            const labels = context.payload.issue.labels.map(l => l.name).join(', ') || 'ninguna';
 
             const issue = await github.rest.issues.create({
               owner: 'zentto-erp',
               repo: 'zentto-web',
-              title: `[Support #${context.issue.number}] ${title}`,
+              title: `[Support #${context.issue.number}] ${context.payload.issue.title}`,
               body: [
                 `## Origen: [Support Ticket #${context.issue.number}](${supportUrl})`,
                 '',
-                '## Causa raíz',
-                analysis.cause,
+                '## Descripcion del ticket',
+                context.payload.issue.body || '_Sin descripcion_',
                 '',
-                '## Archivos afectados',
-                (analysis.affected_files || []).map(f => '- `' + f + '`').join('\n') || '_No identificados_',
-                '',
-                '## Solución propuesta',
-                analysis.solution,
-                '',
-                `**Riesgo:** ${analysis.risk} | **Esfuerzo:** ${analysis.effort}`,
+                `**Etiquetas originales:** ${labels}`,
                 '',
                 '---',
-                '_Issue creado automáticamente por el agente de soporte AI._'
+                '_Issue creado automaticamente desde el repositorio de soporte._'
               ].join('\n'),
-              labels: ['ai-generated', 'support']
+              labels: ['support', 'ai-generated']
             });
 
-            // Comment on support issue with link to technical issue
             await github.rest.issues.createComment({
               owner: context.repo.owner,
               repo: context.repo.repo,
               issue_number: context.issue.number,
-              body: `📋 Issue técnico creado: [zentto-web#${issue.data.number}](${issue.data.html_url})`
+              body: `Issue tecnico creado: [zentto-web#${issue.data.number}](${issue.data.html_url})`
             });
 
             await github.rest.issues.addLabels({
@@ -202,194 +60,4 @@ jobs:
               repo: context.repo.repo,
               issue_number: context.issue.number,
               labels: ['estado:en-revision']
-            });
-
-  create-pr:
-    if: github.event.label.name == 'ai-pr'
-    runs-on: ubuntu-latest
-    permissions:
-      issues: write
-    steps:
-      - name: Comment — Creating PR
-        uses: actions/github-script@v7
-        with:
-          script: |
-            await github.rest.issues.createComment({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              issue_number: context.issue.number,
-              body: '🔧 **Creando solución...**\n\nGenerando código y abriendo Pull Request en el repositorio de desarrollo.'
-            });
-
-      - name: Checkout zentto-web
-        uses: actions/checkout@v4
-        with:
-          repository: zentto-erp/zentto-web
-          token: ${{ secrets.GH_PAT }}
-          ref: developer
-          path: zentto-web
-
-      - uses: actions/setup-node@v4
-        with:
-          node-version: 22
-
-      - name: Get analysis context
-        id: ctx
-        uses: actions/github-script@v7
-        with:
-          github-token: ${{ secrets.GH_PAT }}
-          script: |
-            // Find the zentto-web issue linked from comments
-            const comments = await github.rest.issues.listComments({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              issue_number: context.issue.number,
-            });
-
-            let webIssueNumber = null;
-            for (const c of comments.data) {
-              const match = c.body.match(/zentto-web#(\d+)/);
-              if (match) { webIssueNumber = match[1]; break; }
-            }
-
-            let analysis = '';
-            if (webIssueNumber) {
-              const webIssue = await github.rest.issues.get({
-                owner: 'zentto-erp',
-                repo: 'zentto-web',
-                issue_number: parseInt(webIssueNumber),
-              });
-              analysis = webIssue.data.body;
-            }
-
-            core.setOutput('analysis', analysis || comments.data.map(c => c.body).join('\n'));
-            core.setOutput('title', context.payload.issue.title);
-            core.setOutput('number', String(context.payload.issue.number));
-
-      - name: Generate fix with Claude
-        id: gen
-        env:
-          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
-          ISSUE_TITLE: ${{ steps.ctx.outputs.title }}
-          ISSUE_NUMBER: ${{ steps.ctx.outputs.number }}
-          ANALYSIS: ${{ steps.ctx.outputs.analysis }}
-        run: |
-          cd zentto-web
-          git config user.name "zentto-bot"
-          git config user.email "bot@zentto.net"
-          BRANCH="fix/support-issue-${ISSUE_NUMBER}"
-          git checkout -b "$BRANCH"
-
-          node << 'SCRIPT'
-          const https = require("https");
-          const fs = require("fs");
-          const path = require("path");
-
-          const prompt = [
-            "You are implementing a fix for Zentto ERP. The repo uses Node.js + Express + TypeScript for the API and Next.js for the frontend.",
-            "",
-            "Issue: " + process.env.ISSUE_TITLE,
-            "",
-            "Technical Analysis:",
-            process.env.ANALYSIS,
-            "",
-            'Output ONLY valid JSON (no markdown wrapping): {"files": [{"path": "relative/path/from/repo/root", "action": "create|modify", "content": "COMPLETE file content"}]}',
-            "RULES:",
-            "- Use real file paths relative to repo root",
-            "- For modifications, include the COMPLETE new file content",
-            "- Follow existing code patterns (TypeScript, Express routes, callSp helpers)",
-            "- If SQL changes needed, include BOTH sqlweb/ AND sqlweb-pg/ versions",
-            '- If you cannot generate a fix, return {"files": [], "reason": "explanation"}'
-          ].join("\n");
-
-          const body = JSON.stringify({
-            model: "claude-sonnet-4-20250514",
-            max_tokens: 8192,
-            messages: [{ role: "user", content: prompt }]
-          });
-
-          const req = https.request({
-            hostname: "api.anthropic.com",
-            path: "/v1/messages",
-            method: "POST",
-            headers: {
-              "x-api-key": process.env.ANTHROPIC_API_KEY,
-              "anthropic-version": "2023-06-01",
-              "content-type": "application/json",
-            }
-          }, res => {
-            let data = "";
-            res.on("data", c => data += c);
-            res.on("end", () => {
-              try {
-                const text = JSON.parse(data).content[0].text;
-                const match = text.match(/\{[\s\S]*\}/);
-                if (!match) { fs.writeFileSync("/tmp/has_changes", "false"); return; }
-                const changes = JSON.parse(match[0]);
-                if (!changes.files || changes.files.length === 0) {
-                  fs.writeFileSync("/tmp/has_changes", "false");
-                  return;
-                }
-                for (const file of changes.files) {
-                  if (file.action === "delete" && fs.existsSync(file.path)) {
-                    fs.unlinkSync(file.path);
-                  } else {
-                    fs.mkdirSync(path.dirname(file.path), { recursive: true });
-                    fs.writeFileSync(file.path, file.content);
-                  }
-                  console.log(file.action + ": " + file.path);
-                }
-                fs.writeFileSync("/tmp/has_changes", "true");
-              } catch (e) {
-                console.log("Error: " + e.message);
-                fs.writeFileSync("/tmp/has_changes", "false");
-              }
-            });
-          });
-          req.on("error", () => fs.writeFileSync("/tmp/has_changes", "false"));
-          req.write(body);
-          req.end();
-          SCRIPT
-
-          sleep 15
-          HAS=$(cat /tmp/has_changes 2>/dev/null || echo "false")
-          if [ "$HAS" = "true" ]; then
-            git add -A
-            git commit -m "fix: resolve support issue #${ISSUE_NUMBER}"
-            git push origin "$BRANCH"
-            echo "has_changes=true" >> $GITHUB_OUTPUT
-            echo "branch=$BRANCH" >> $GITHUB_OUTPUT
-          else
-            echo "has_changes=false" >> $GITHUB_OUTPUT
-          fi
-
-      - name: Create Draft PR
-        if: steps.gen.outputs.has_changes == 'true'
-        uses: actions/github-script@v7
-        with:
-          github-token: ${{ secrets.GH_PAT }}
-          script: |
-            const branch = '${{ steps.gen.outputs.branch }}';
-            const num = ${{ steps.ctx.outputs.number }};
-            const title = `${{ steps.ctx.outputs.title }}`;
-            const pr = await github.rest.pulls.create({
-              owner: 'zentto-erp', repo: 'zentto-web',
-              title: `fix: ${title} (support #${num})`,
-              body: `## Support #${num}\n\nTicket: https://github.com/zentto-erp/zentto-support/issues/${num}\n\n> ⚠️ **PR generada automáticamente.** Revisar antes de mergear.\n\n### Checklist\n- [ ] Código revisado\n- [ ] Tests pasan\n- [ ] SQL en ambos motores`,
-              head: branch, base: 'developer', draft: true,
-            });
-            await github.rest.issues.createComment({
-              owner: 'zentto-erp', repo: 'zentto-support', issue_number: num,
-              body: `✅ **Solución creada:** [PR zentto-web#${pr.data.number}](${pr.data.html_url})\n\nLa solución está en revisión por el equipo de desarrollo.`
-            });
-
-      - name: No changes possible
-        if: steps.gen.outputs.has_changes != 'true'
-        uses: actions/github-script@v7
-        with:
-          script: |
-            await github.rest.issues.createComment({
-              owner: context.repo.owner, repo: context.repo.repo,
-              issue_number: context.issue.number,
-              body: '⚠️ No fue posible generar una solución automática. El equipo de desarrollo revisará este caso manualmente.'
             });
