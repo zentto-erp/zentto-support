@@ -4,6 +4,9 @@ on:
   issues:
     types: [labeled]
 
+permissions:
+  contents: read
+
 jobs:
   forward-to-dev:
     if: github.event.label.name == 'ai-fix'
