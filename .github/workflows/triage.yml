@@ -1,0 +1,141 @@
+name: Triage IA
+
+# Triagea cada issue nuevo (o reabierto) con IA y aplica las etiquetas que
+# disparan el resto del pipeline de soporte:
+#   - `ai-fix`     -> claude-auto-fix.yml ("Forward to Dev") reenvia a zentto-web
+#   - `modulo:*`   -> ruteo por departamento
+#   - `urgent`     -> prioridad critica
+#
+# El template `bug_report.yml` solo aplica el label `bug`, por lo que SIN este
+# workflow ningun ticket creado desde el formulario web (o desde la app movil
+# via el endpoint server-side) recibe `ai-fix` -> nunca se auto-derivaba.
+#
+# Opt-in: requiere la variable de repo `AI_TRIAGE_ENABLED == 'true'`.
+# Si la llamada a la IA falla, hay un fallback deterministico que igualmente
+# aplica `ai-fix` a los bugs para no romper el eslabon.
+
+on:
+  issues:
+    types: [opened, reopened]
+
+permissions:
+  contents: read
+
+jobs:
+  triage:
+    if: ${{ vars.AI_TRIAGE_ENABLED == 'true' }}
+    runs-on: ubuntu-latest
+    permissions:
+      issues: write
+    steps:
+      - name: Clasificar y etiquetar
+        uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7.1.0
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        with:
+          script: |
+            const issue = context.payload.issue;
+            const title = issue.title || '';
+            const body = (issue.body || '').slice(0, 6000);
+            const existing = (issue.labels || []).map((l) => (typeof l === 'string' ? l : l.name));
+
+            // Mapa de modulos -> label de departamento (alineado a los labels del repo).
+            const MODULE_LABELS = {
+              ventas: 'modulo:ventas',
+              compras: 'modulo:compras',
+              inventario: 'modulo:inventario',
+              contabilidad: 'modulo:contabilidad',
+              bancos: 'modulo:bancos',
+              nomina: 'modulo:nomina',
+              pos: 'modulo:pos',
+              restaurante: 'modulo:restaurante',
+              ecommerce: 'modulo:ecommerce',
+              crm: 'modulo:crm',
+              logistica: 'modulo:logistica',
+              auditoria: 'modulo:auditoria',
+              fiscal: 'modulo:fiscal',
+              mobile: 'modulo:mobile',
+            };
+            const VALID_MODULES = Object.keys(MODULE_LABELS);
+            const VALID_CATEGORIES = ['bug', 'feature', 'question'];
+            const VALID_SEVERITIES = ['critico', 'alto', 'medio', 'bajo'];
+
+            // --- Clasificacion con IA (Claude Haiku) ---
+            let cls = null;
+            const apiKey = process.env.ANTHROPIC_API_KEY;
+            if (apiKey) {
+              try {
+                const prompt = [
+                  'Eres el triage de soporte de Zentto ERP. Clasifica el ticket y responde',
+                  'EXCLUSIVAMENTE un objeto JSON valido, sin texto adicional ni markdown, con esta forma:',
+                  '{"category":"bug|feature|question","module":"<uno de: ' + VALID_MODULES.join(', ') + ', otro>","severity":"critico|alto|medio|bajo"}',
+                  '',
+                  'Titulo: ' + title,
+                  'Cuerpo: ' + body,
+                ].join('\n');
+
+                const resp = await fetch('https://api.anthropic.com/v1/messages', {
+                  method: 'POST',
+                  headers: {
+                    'x-api-key': apiKey,
+                    'anthropic-version': '2023-06-01',
+                    'content-type': 'application/json',
+                  },
+                  body: JSON.stringify({
+                    model: 'claude-3-5-haiku-latest',
+                    max_tokens: 200,
+                    messages: [{ role: 'user', content: prompt }],
+                  }),
+                });
+
+                if (resp.ok) {
+                  const data = await resp.json();
+                  const text = (data.content || []).map((c) => c.text || '').join('').trim();
+                  const match = text.match(/\{[\s\S]*\}/);
+                  if (match) cls = JSON.parse(match[0]);
+                } else {
+                  core.warning('Anthropic API HTTP ' + resp.status + ' — usando fallback deterministico');
+                }
+              } catch (err) {
+                core.warning('Fallo la clasificacion IA (' + err.message + ') — usando fallback deterministico');
+              }
+            } else {
+              core.warning('ANTHROPIC_API_KEY no configurada — usando fallback deterministico');
+            }
+
+            // --- Normalizacion + fallback ---
+            // category: IA -> label existente -> 'bug' por defecto (los bugs son la
+            // mayoria y son los unicos que deben derivarse con ai-fix).
+            let category = cls && VALID_CATEGORIES.includes(cls.category) ? cls.category : null;
+            if (!category) {
+              category = ['bug', 'feature', 'question'].find((c) => existing.includes(c)) || 'bug';
+            }
+
+            let severity = cls && VALID_SEVERITIES.includes(cls.severity) ? cls.severity : null;
+
+            let moduleLabel = null;
+            if (cls && typeof cls.module === 'string') {
+              const m = cls.module.trim().toLowerCase();
+              if (MODULE_LABELS[m]) moduleLabel = MODULE_LABELS[m];
+            }
+
+            // --- Construir set de labels a aplicar ---
+            const toAdd = new Set();
+            // ai-fix SOLO para bugs: dispara claude-auto-fix.yml (Forward to Dev).
+            if (category === 'bug') toAdd.add('ai-fix');
+            if (moduleLabel) toAdd.add(moduleLabel);
+            if (severity === 'critico') toAdd.add('urgent');
+
+            const labels = [...toAdd].filter((l) => !existing.includes(l));
+            if (labels.length === 0) {
+              core.info('Sin labels nuevos que aplicar (ya presentes).');
+              return;
+            }
+
+            await github.rest.issues.addLabels({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: issue.number,
+              labels,
+            });
+            core.info('Labels aplicados: ' + labels.join(', '));
