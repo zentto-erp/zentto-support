@@ -24,7 +24,7 @@ permissions:
 jobs:
   triage:
     if: ${{ vars.AI_TRIAGE_ENABLED == 'true' }}
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, zentto-ci]
     permissions:
       issues: write
     steps:
