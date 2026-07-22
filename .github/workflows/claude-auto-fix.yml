@@ -10,7 +10,7 @@ permissions:
 jobs:
   forward-to-dev:
     if: github.event.label.name == 'ai-fix'
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, zentto-ci]
     permissions:
       issues: write
     steps:
