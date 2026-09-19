@@ -1,0 +1,349 @@
+name: Responder ticket
+
+# Hoy un ticket nuevo recibe un acuse ("Ticket registrado, el equipo tecnico ha
+# sido notificado") y se reenvia a zentto-web. Nadie le responde al usuario.
+#
+# Pero buena parte de los tickets NO necesitan a un desarrollador: son dudas de
+# uso, o les falta el dato con el que se podrian diagnosticar. Para esas, la
+# respuesta ya existe — el RAG de soporte (notify + Qdrant sobre la
+# documentacion) lleva tiempo desplegado y contesta en segundos. Solo que nadie
+# lo llamaba desde aqui.
+#
+# ESTE WORKFLOW DECIDE, NO IMPROVISA
+#   1. Juicio tipado sobre el ticket: que es, y si trae lo necesario.
+#   2. Si es contestable, se le pregunta al RAG.
+#   3. SEGUNDO juicio tipado sobre la respuesta: ¿contesta ESTE ticket?
+#      Una respuesta plausible pero de otro tema es peor que ninguna: gasta la
+#      confianza del usuario y le hace perder el tiempo.
+#   4. Solo si pasa ese filtro se publica. Si no, se calla y sigue el camino
+#      de siempre (reenvio a dev), que no se toca.
+#
+# NUNCA sustituye a una persona: cada respuesta dice que es automatica y que
+# el equipo la revisa igual. El ticket no se cierra solo.
+#
+# Opt-in por variable de repo, como el resto del ecosistema.
+
+on:
+  issues:
+    types: [opened, reopened]
+  # Disparo manual sobre un ticket que ya existe, para probarlo sin esperar a
+  # que entre uno nuevo. `ensayo` corre los juicios y escribe el veredicto en
+  # el log SIN publicar nada en el issue: es la forma de ver que decidiria
+  # sobre tickets reales antes de dejarlo suelto.
+  workflow_dispatch:
+    inputs:
+      issue:
+        description: 'Numero del issue a atender'
+        required: true
+        type: string
+      ensayo:
+        description: 'Solo decidir y registrar en el log, sin comentar el issue'
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: responder-${{ github.event.issue.number || inputs.issue }}
+  cancel-in-progress: false
+
+jobs:
+  responder:
+    if: ${{ vars.AI_RESPONDER_ENABLED == 'true' }}
+    # ubuntu-latest a proposito: este repo es PUBLICO y cualquiera puede abrir
+    # un issue, o sea disparar este job. En un runner propio eso seria dar
+    # ejecucion a desconocidos; en hosted los minutos de un repo publico ademas
+    # no se facturan. (Los workflows viejos de aqui siguen en self-hosted.)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      issues: write
+    steps:
+      - name: Responder si se puede
+        uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7.1.0
+        env:
+          TYPESAFE_API_KEY: ${{ secrets.TYPESAFE_API_KEY }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          SOPORTE_URL: ${{ vars.SOPORTE_CHAT_URL || 'https://notify.zentto.net/api/support/chat' }}
+          ISSUE_MANUAL: ${{ inputs.issue }}
+          ENSAYO: ${{ inputs.ensayo }}
+        with:
+          script: |
+            // En disparo manual el issue no viene en el payload: se lee.
+            let issue = context.payload.issue;
+            if (!issue && process.env.ISSUE_MANUAL) {
+              const r = await github.rest.issues.get({
+                owner: context.repo.owner, repo: context.repo.repo,
+                issue_number: Number(process.env.ISSUE_MANUAL),
+              });
+              issue = r.data;
+            }
+            if (!issue) { core.setFailed('Sin issue que atender.'); return; }
+
+            // Ensayo: se decide todo igual, pero no se escribe en el ticket.
+            // Asi se puede ver que haria sobre tickets reales sin que el
+            // cliente reciba un comentario de prueba.
+            const ensayo = String(process.env.ENSAYO || '') === 'true';
+            if (ensayo) core.info(`ENSAYO sobre #${issue.number}: no se publicara nada`);
+
+            const titulo = (issue.title || '').slice(0, 300);
+            const cuerpo = (issue.body || '').slice(0, 6000);
+            const ticket = `${titulo}\n\n${cuerpo}`.trim();
+            if (!ticket) { core.info('Ticket vacio — nada que responder.'); return; }
+
+            /* ── Juicios tipados ─────────────────────────────────────────
+             * TypeSafe devuelve probabilidades sobre preguntas declaradas, no
+             * texto que haya que parsear. Es lo que hace falta para decidir:
+             * el triage de al lado le pide JSON a un modelo en prosa y lo
+             * saca con una regex, y cuando el modelo se sale del formato la
+             * decision se pierde en silencio.
+             *
+             * `questions` es un MAPA por id. Un array hace que las respuestas
+             * vuelvan sin nombre y se lea la pregunta equivocada.
+             */
+            async function juzgar(state, questions) {
+              const key = (process.env.TYPESAFE_API_KEY || '').trim();
+              if (!key) return null;
+              const ctrl = new AbortController();
+              const corte = setTimeout(() => ctrl.abort(), 15000);
+              try {
+                const r = await fetch('https://api.typesafe.ai/v1/systemone', {
+                  method: 'POST',
+                  headers: { Authorization: `Bearer ${key}`, 'Content-Type': 'application/json' },
+                  body: JSON.stringify({ state, model: 'jev-latest', questions }),
+                  signal: ctrl.signal,
+                });
+                if (!r.ok) { core.warning(`TypeSafe HTTP ${r.status}`); return null; }
+                return (await r.json()).answers || null;
+              } catch (e) {
+                core.warning(`TypeSafe sin respuesta (${e.message})`);
+                return null;
+              } finally { clearTimeout(corte); }
+            }
+            const opcion = (a, id) => (a && a[id] && a[id].type === 'choice')
+              ? { v: a[id].choice, c: a[id].confidence } : null;
+            const siNo = (a, id) => (a && a[id] && a[id].type === 'noul') ? a[id].noul : null;
+
+            // 1. ¿Que clase de ticket es, y trae con que trabajar?
+            const t = await juzgar({ ticket }, {
+              clase: {
+                type: 'choice',
+                instructions: 'Clasifica que necesita realmente este ticket de soporte de un ERP.',
+                criteria: {
+                  duda_de_uso: 'El usuario no sabe COMO hacer algo, o que significa algo. El producto funciona; le falta saber usarlo',
+                  fallo: 'Algo del producto no hace lo que deberia: da error, devuelve un numero mal, no guarda, no carga',
+                  peticion: 'Pide algo que el producto no hace todavia: una funcion nueva, un campo, un reporte',
+                },
+              },
+              // Medido sobre tickets reales del repo: preguntado como si/no
+              // daba ~50% para todo, incluido uno que era un titulo cortado
+              // sin cuerpo — la pregunta no discriminaba. Preguntado por
+              // NIVELES sobre hechos observables (¿dice donde? ¿dice que hizo?
+              // ¿dice que paso?) el orden sale limpio y monotono:
+              //   "no me funciona nada"        0.00
+              //   titulo cortado sin cuerpo    0.66
+              //   "en compras no puedo guardar" 1.03
+              //   login lento con navegador    1.37
+              //   error 500 al generar reporte 1.71
+              //   pasos + proveedor + mensaje  2.00
+              detalle: {
+                type: 'score',
+                instructions:
+                  'Valora cuanto se puede hacer con este ticket TAL COMO ESTA ESCRITO, ' +
+                  'sin preguntarle nada mas al usuario.',
+                criteria: [
+                  'Nada: es una frase suelta o esta cortada. No dice en que parte del sistema ocurre ni que hizo la persona',
+                  'A medias: se sabe el area o el modulo, pero no los pasos que siguio ni el dato concreto con el que fallo',
+                  'Suficiente: dice donde ocurre, que hizo la persona y que paso — se puede reproducir o entender sin preguntar',
+                ],
+              },
+            });
+
+            const clase = opcion(t, 'clase');
+            const nivel = (t && t.detalle && t.detalle.type === 'score') ? t.detalle.score : null;
+            core.info(`clase=${clase ? clase.v + ' ' + clase.c.toFixed(2) : 'n/d'} detalle=${nivel}`);
+
+            // En ensayo, lo que se habria escrito va al log del run en vez de
+            // al ticket. El resumen del job lo deja legible sin abrir el log.
+            const comentar = async (body) => {
+              if (ensayo) {
+                core.info('--- COMENTARIO QUE SE HABRIA PUBLICADO ---\n' + body);
+                await core.summary
+                  .addHeading(`Ensayo sobre #${issue.number}`, 3)
+                  .addRaw(body).write();
+                return;
+              }
+              return github.rest.issues.createComment({
+                owner: context.repo.owner, repo: context.repo.repo,
+                issue_number: issue.number, body,
+              });
+            };
+            const etiquetar = (labels) => {
+              if (ensayo) { core.info(`Etiquetas que se habrian puesto: ${labels.join(', ')}`); return Promise.resolve(); }
+              return github.rest.issues.addLabels({
+                owner: context.repo.owner, repo: context.repo.repo,
+                issue_number: issue.number, labels,
+              }).catch((e) => core.warning(`No se pudo etiquetar: ${e.message}`));
+            };
+
+            const PIE = '\n\n---\n_Respuesta automatica del asistente de Zentto. ' +
+              'El equipo revisa igualmente este ticket; si esto no resuelve tu caso, ' +
+              'responde aqui y seguimos._';
+
+            // 2. Si es un FALLO y le falta lo esencial, lo util es preguntar —
+            //    y preguntar LO QUE FALTA, no un formulario generico que el
+            //    usuario ya relleno. El texto lo escribe un modelo barato; QUE
+            //    se pregunta lo decidio el juicio de arriba.
+            //
+            //    Solo para fallos, a proposito. "Reproducir" no significa nada
+            //    en una peticion de funcion ni en una pregunta conceptual:
+            //    medido, "exportar asientos a Excel" daba 0.92 y "que
+            //    diferencia hay entre nota de credito y anulacion" 0.64 — los
+            //    dos perfectamente claros, y los dos habrian recibido un
+            //    interrogatorio absurdo.
+            //
+            //    Por debajo de 1 el ticket esta mas cerca de "nada" que de "a
+            //    medias": no hay con que trabajar, y mandarlo a dev asi solo
+            //    traslada la pregunta a otra persona.
+            const esFallo = clase && clase.v === 'fallo' && clase.c >= 0.6;
+            if (esFallo && nivel !== null && nivel < 1.0) {
+              const apiKey = (process.env.ANTHROPIC_API_KEY || '').trim();
+              let preguntas = '';
+              if (apiKey) {
+                try {
+                  const r = await fetch('https://api.anthropic.com/v1/messages', {
+                    method: 'POST',
+                    headers: { 'x-api-key': apiKey, 'anthropic-version': '2023-06-01', 'content-type': 'application/json' },
+                    body: JSON.stringify({
+                      model: 'claude-3-5-haiku-latest',
+                      max_tokens: 350,
+                      messages: [{ role: 'user', content:
+                        'Eres soporte de un ERP. Este ticket no trae lo necesario para diagnosticarlo.\n' +
+                        'Escribe como maximo 3 preguntas concretas, en espanol, en lista con guiones, ' +
+                        'pidiendo SOLO lo que falta. No saludes, no te disculpes, no expliques por que preguntas. ' +
+                        'No pidas datos que el ticket ya da. Nunca pidas contrasenas, tokens ni datos bancarios.\n\n' +
+                        'Ticket:\n' + ticket }],
+                    }),
+                  });
+                  if (r.ok) {
+                    const d = await r.json();
+                    preguntas = (d.content || []).map((c) => c.text || '').join('').trim();
+                  }
+                } catch (e) { core.warning(`Haiku no respondio (${e.message})`); }
+              }
+              if (preguntas) {
+                await comentar('Para poder reproducir esto necesitamos un par de datos mas:\n\n' + preguntas + PIE);
+                await etiquetar(['falta-informacion']);
+                core.info('Pedida la informacion que falta.');
+                return;
+              }
+              core.info('Falta informacion pero no se pudo redactar la pregunta — sigue el camino normal.');
+              return;
+            }
+
+            // 3. Un fallo real o una peticion de funcion no se contestan con
+            //    documentacion: van a dev, como hasta ahora.
+            if (clase && clase.v !== 'duda_de_uso' && clase.c >= 0.6) {
+              core.info(`Es ${clase.v}: se deja el camino de siempre (reenvio a dev).`);
+              return;
+            }
+
+            // 4. Duda de uso -> preguntarle al RAG de soporte, que responde
+            //    sobre la documentacion publica del producto.
+            let respuesta = null, fuentes = [];
+            try {
+              const r = await fetch(process.env.SOPORTE_URL, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                  // El endpoint corta en 1500: se manda el ticket recortado.
+                  message: ticket.slice(0, 1400),
+                  visitorType: 'support-ticket',
+                  appContext: 'erp',
+                  locale: 'es',
+                  pageUrl: issue.html_url,
+                }),
+              });
+              if (r.ok) {
+                const d = await r.json();
+                if (d && d.ok !== false && d.answer) {
+                  respuesta = String(d.answer).trim();
+                  fuentes = Array.isArray(d.sources) ? d.sources : [];
+                }
+              } else {
+                core.warning(`Soporte HTTP ${r.status}`);
+              }
+            } catch (e) { core.warning(`Soporte no respondio (${e.message})`); }
+
+            if (!respuesta) { core.info('Sin respuesta del RAG — camino de siempre.'); return; }
+
+            // 5. El filtro que decide si esto se publica.
+            //
+            // Un RAG devuelve SIEMPRE algo: recupera los trozos mas parecidos
+            // y redacta. Cuando la documentacion no cubre el caso, lo que sale
+            // es una respuesta correcta sobre OTRA cosa — plausible, bien
+            // escrita, inutil. Publicar eso es peor que no publicar: el
+            // usuario pierde el tiempo y deja de leer lo que le mandamos.
+            //
+            // Por eso se juzga la respuesta contra el ticket, no la confianza
+            // que el propio RAG se pone.
+            const v = await juzgar({ ticket, respuesta_propuesta: respuesta }, {
+              contesta: {
+                type: 'noul',
+                instructions:
+                  'La respuesta propuesta resuelve lo que este ticket concreto pregunta. ' +
+                  'No juzgues si esta bien escrita ni si habla del mismo producto: juzga si ' +
+                  'quien escribio el ticket, al leerla, sabra que hacer.',
+                criteria: {
+                  true: 'Responde a lo que se pregunta y deja al usuario en condiciones de continuar',
+                  false: 'Habla de otra cosa, se queda en generalidades, o repite el problema sin resolverlo',
+                },
+              },
+              se_inventa_algo: {
+                type: 'noul',
+                instructions:
+                  'La respuesta afirma cosas concretas del producto (nombres de pantallas, botones, ' +
+                  'campos, menus, pasos) que no se sostienen en lo que el ticket cuenta y suenan inventadas.',
+                criteria: {
+                  true: 'Menciona elementos concretos que parecen inventados para rellenar',
+                  false: 'Lo que afirma es generico o coherente, sin inventar nombres de pantallas ni pasos',
+                },
+              },
+              filtra_interno: {
+                type: 'noul',
+                instructions:
+                  'La respuesta expone algo que no deberia ver un cliente en un repositorio publico: ' +
+                  'rutas de archivos del codigo, nombres de repositorios internos, direcciones IP, ' +
+                  'nombres de servidores, variables de entorno, consultas SQL o nombres de tablas.',
+                criteria: {
+                  true: 'Contiene alguno de esos detalles internos',
+                  false: 'Habla solo de lo que el usuario ve en pantalla',
+                },
+              },
+            });
+
+            const contesta = siNo(v, 'contesta');
+            const inventa = siNo(v, 'se_inventa_algo');
+            const filtra = siNo(v, 'filtra_interno');
+            core.info(`contesta=${contesta} inventa=${inventa} filtra_interno=${filtra}`);
+
+            // Sin juicio no se publica. La verificacion no es un adorno: es la
+            // unica razon por la que se puede dejar esto contestando solo.
+            if (contesta === null) { core.info('Sin verificacion — no se publica.'); return; }
+            if (contesta < 0.7) { core.info('La respuesta no contesta este ticket — no se publica.'); return; }
+            if (inventa !== null && inventa >= 0.5) { core.info('La respuesta parece inventar detalles — no se publica.'); return; }
+            if (filtra !== null && filtra >= 0.3) {
+              // Umbral bajo a proposito: el repo es publico y un falso positivo
+              // solo cuesta un ticket sin responder.
+              core.warning('La respuesta rozaba detalles internos — no se publica.');
+              return;
+            }
+
+            const enlaces = fuentes
+              .map((s) => (s && (s.url || s.source)) ? `- ${s.title || s.url || s.source}: ${s.url || s.source}` : null)
+              .filter(Boolean).slice(0, 3);
+
+            await comentar(respuesta + (enlaces.length ? '\n\n**Donde leerlo completo:**\n' + enlaces.join('\n') : '') + PIE);
+            await etiquetar(['respondido-ia']);
+            core.info('Respuesta publicada.');
