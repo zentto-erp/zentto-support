@@ -26,12 +26,26 @@ name: Responder ticket
 on:
   issues:
     types: [opened, reopened]
+  # Disparo manual sobre un ticket que ya existe, para probarlo sin esperar a
+  # que entre uno nuevo. `ensayo` corre los juicios y escribe el veredicto en
+  # el log SIN publicar nada en el issue: es la forma de ver que decidiria
+  # sobre tickets reales antes de dejarlo suelto.
+  workflow_dispatch:
+    inputs:
+      issue:
+        description: 'Numero del issue a atender'
+        required: true
+        type: string
+      ensayo:
+        description: 'Solo decidir y registrar en el log, sin comentar el issue'
+        type: boolean
+        default: true
 
 permissions:
   contents: read
 
 concurrency:
-  group: responder-${{ github.event.issue.number }}
+  group: responder-${{ github.event.issue.number || inputs.issue }}
   cancel-in-progress: false
 
 jobs:
@@ -52,9 +66,27 @@ jobs:
           TYPESAFE_API_KEY: ${{ secrets.TYPESAFE_API_KEY }}
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
           SOPORTE_URL: ${{ vars.SOPORTE_CHAT_URL || 'https://notify.zentto.net/api/support/chat' }}
+          ISSUE_MANUAL: ${{ inputs.issue }}
+          ENSAYO: ${{ inputs.ensayo }}
         with:
           script: |
-            const issue = context.payload.issue;
+            // En disparo manual el issue no viene en el payload: se lee.
+            let issue = context.payload.issue;
+            if (!issue && process.env.ISSUE_MANUAL) {
+              const r = await github.rest.issues.get({
+                owner: context.repo.owner, repo: context.repo.repo,
+                issue_number: Number(process.env.ISSUE_MANUAL),
+              });
+              issue = r.data;
+            }
+            if (!issue) { core.setFailed('Sin issue que atender.'); return; }
+
+            // Ensayo: se decide todo igual, pero no se escribe en el ticket.
+            // Asi se puede ver que haria sobre tickets reales sin que el
+            // cliente reciba un comentario de prueba.
+            const ensayo = String(process.env.ENSAYO || '') === 'true';
+            if (ensayo) core.info(`ENSAYO sobre #${issue.number}: no se publicara nada`);
+
             const titulo = (issue.title || '').slice(0, 300);
             const cuerpo = (issue.body || '').slice(0, 6000);
             const ticket = `${titulo}\n\n${cuerpo}`.trim();
@@ -132,14 +164,28 @@ jobs:
             const nivel = (t && t.detalle && t.detalle.type === 'score') ? t.detalle.score : null;
             core.info(`clase=${clase ? clase.v + ' ' + clase.c.toFixed(2) : 'n/d'} detalle=${nivel}`);
 
-            const comentar = (body) => github.rest.issues.createComment({
-              owner: context.repo.owner, repo: context.repo.repo,
-              issue_number: issue.number, body,
-            });
-            const etiquetar = (labels) => github.rest.issues.addLabels({
-              owner: context.repo.owner, repo: context.repo.repo,
-              issue_number: issue.number, labels,
-            }).catch((e) => core.warning(`No se pudo etiquetar: ${e.message}`));
+            // En ensayo, lo que se habria escrito va al log del run en vez de
+            // al ticket. El resumen del job lo deja legible sin abrir el log.
+            const comentar = async (body) => {
+              if (ensayo) {
+                core.info('--- COMENTARIO QUE SE HABRIA PUBLICADO ---\n' + body);
+                await core.summary
+                  .addHeading(`Ensayo sobre #${issue.number}`, 3)
+                  .addRaw(body).write();
+                return;
+              }
+              return github.rest.issues.createComment({
+                owner: context.repo.owner, repo: context.repo.repo,
+                issue_number: issue.number, body,
+              });
+            };
+            const etiquetar = (labels) => {
+              if (ensayo) { core.info(`Etiquetas que se habrian puesto: ${labels.join(', ')}`); return Promise.resolve(); }
+              return github.rest.issues.addLabels({
+                owner: context.repo.owner, repo: context.repo.repo,
+                issue_number: issue.number, labels,
+              }).catch((e) => core.warning(`No se pudo etiquetar: ${e.message}`));
+            };
 
             const PIE = '\n\n---\n_Respuesta automatica del asistente de Zentto. ' +
               'El equipo revisa igualmente este ticket; si esto no resuelve tu caso, ' +
