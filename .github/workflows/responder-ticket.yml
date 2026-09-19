@@ -288,7 +288,12 @@ jobs:
             //
             // Por eso se juzga la respuesta contra el ticket, no la confianza
             // que el propio RAG se pone.
-            const v = await juzgar({ ticket, respuesta_propuesta: respuesta }, {
+            // La documentacion que respalda la respuesta va DENTRO del estado:
+            // sin ella, preguntar si algo esta inventado es preguntar al aire.
+            const documentacion = fuentes.slice(0, 5).map((s) => ({
+              titulo: s.title, url: s.url, extracto: s.excerpt,
+            }));
+            const v = await juzgar({ ticket, respuesta_propuesta: respuesta, documentacion_adjunta: documentacion }, {
               contesta: {
                 type: 'noul',
                 instructions:
@@ -300,14 +305,30 @@ jobs:
                   false: 'Habla de otra cosa, se queda en generalidades, o repite el problema sin resolverlo',
                 },
               },
+              // Se juzga contra la DOCUMENTACION, no contra el ticket.
+              //
+              // La primera version preguntaba si lo afirmado «se sostiene en lo
+              // que el ticket cuenta». El ticket es la queja de un usuario y
+              // nunca nombra pantallas, asi que CUALQUIER respuesta que nombre
+              // una parecia inventada: la pregunta solo podia responder que si.
+              // Medido: una respuesta que decia «modulo de Conteo fisico» —
+              // que existe y estaba en la documentacion citada — daba 51% y se
+              // frenaba. Un falso positivo que callaba una respuesta correcta.
+              //
+              // Y no basta con el enlace: juzgando solo por la URL, «modulo de
+              // Cobranza» junto a /ventas/cobros/ pasaba por bueno (36%). Hace
+              // falta el TEXTO. Con el extracto delante: 97% / 13% / 70% sobre
+              // esos tres casos reales, que es lo correcto en los tres.
               se_inventa_algo: {
                 type: 'noul',
                 instructions:
-                  'La respuesta afirma cosas concretas del producto (nombres de pantallas, botones, ' +
-                  'campos, menus, pasos) que no se sostienen en lo que el ticket cuenta y suenan inventadas.',
+                  'La respuesta nombra pantallas, modulos, menus, campos o pasos CONCRETOS del producto ' +
+                  'que no aparecen en la documentacion adjunta. Comparalos contra el texto de la ' +
+                  'documentacion, no contra lo que suene plausible. Una respuesta que no adjunta NINGUNA ' +
+                  'documentacion y aun asi nombra pantallas concretas no se apoya en nada.',
                 criteria: {
-                  true: 'Menciona elementos concretos que parecen inventados para rellenar',
-                  false: 'Lo que afirma es generico o coherente, sin inventar nombres de pantallas ni pasos',
+                  true: 'Nombra algo concreto que no aparece en la documentacion adjunta, o no adjunta ninguna y lo nombra igual',
+                  false: 'Lo concreto que nombra aparece en la documentacion adjunta, o habla en terminos genericos',
                 },
               },
               filtra_interno: {
